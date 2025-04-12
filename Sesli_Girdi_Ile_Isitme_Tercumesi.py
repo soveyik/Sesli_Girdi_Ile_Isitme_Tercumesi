@@ -1,211 +1,159 @@
-import os
-import json
-import cv2
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
-import typing
-import onnxruntime as ort
-import speech_recognition as sr
+# Gerekli kütüphaneler import ediliyor
+import os  # Dosya ve klasör işlemleri için
+import json  # JSON formatındaki verileri okuyup yazmak için
+import cv2  # OpenCV: Görüntü işleme işlemleri için
+import numpy as np  # Sayısal işlemler ve dizi işlemleri için
+import torch  # PyTorch: Derin öğrenme işlemleri için
+import torch.nn as nn  # Yapay sinir ağı katmanları için
+import torch.optim as optim  # Model eğitimi için optimizasyon algoritmaları
+from torch.utils.data import DataLoader, Dataset  # Veri yükleyici ve özel veri seti sınıfı için
+import typing  # Tür tanımlamaları için (örn. Tuple[int, int])
+import onnxruntime as ort  # ONNX formatındaki modelleri çalıştırmak için
+import speech_recognition as sr  # Sesli konuşmayı yazıya çeviren kütüphane
 
-# =================== AnimeGAN Sınıfı ===================
+# Anime stiline dönüştürme sınıfı tanımlanıyor
 class AnimeGAN:
-    def __init__(self, model_path: str = '', downsize_ratio: float = 1.0):
-        # Model yolunun var olup olmadığını kontrol ederiz
-        if not os.path.exists(model_path):
-            raise Exception(f"Model doesn't exist in {model_path}")
+    def __init__(self, model_path: str = '', downsize_ratio: float = 1.0):  # Yapıcı metod, model yolu ve boyut oranı alır
+        self.model = ort.InferenceSession(model_path)  # ONNX model dosyası yüklenir
+        self.downsize_ratio = downsize_ratio  # Boyut küçültme oranı kaydedilir
 
-        self.downsize_ratio = downsize_ratio
-        # GPU kullanılıp kullanılmadığını kontrol ederiz
-        providers = ['CUDAExecutionProvider'] if ort.get_device() == "GPU" else ['CPUExecutionProvider']
-        # ONNX modelini yükleriz
-        self.ort_sess = ort.InferenceSession(model_path, providers=providers)
+    def to_32s(self, x):  # 32’nin katı en yakın değeri döndüren fonksiyon
+        return 256 if x < 256 else x - x % 32  # 32’nin katı boyut ayarı yapılır
 
-    def to_32s(self, x):
-        # Görüntü boyutlarını 32'nin katı olacak şekilde ayarlarız
-        return 256 if x < 256 else x - x % 32
-
-    def process_frame(self, frame: np.ndarray, x32: bool = True) -> np.ndarray:
-        # Görüntü boyutlarını yeniden boyutlandırırız
-        h, w = frame.shape[:2]
+    def process_frame(self, frame: np.ndarray, x32: bool = True) -> np.ndarray:  # Görseli modele uygun hale getirir
+        h, w = frame.shape[:2]  # Yükseklik ve genişlik alınır
         if x32:
-            frame = cv2.resize(frame, (self.to_32s(int(w * self.downsize_ratio)), self.to_32s(int(h * self.downsize_ratio))))
-        # Görüntüyü işleme için normalize ederiz
-        frame = frame.astype(np.float32) / 127.5 - 1.0
-        return frame
+            h, w = self.to_32s(h), self.to_32s(w)  # Boyutlar 32’nin katı yapılır
+        frame = cv2.resize(frame, (w, h))  # Görüntü yeniden boyutlandırılır
+        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 127.5 - 1.0  # RGB’ye çevirilip normalize edilir
+        img = np.transpose(img, (2, 0, 1))  # Kanal boyutu en başa alınır (HWC -> CHW)
+        img = np.expand_dims(img, axis=0)  # Batch boyutu eklenir
+        return img  # İşlenmiş tensör döndürülür
 
-    def post_process(self, frame: np.ndarray, wh: typing.Tuple[int, int]) -> np.ndarray:
-        # Çıkışı geri dönüştürürüz ve boyutlandırırız
-        frame = (frame.squeeze() + 1.) / 2 * 255
-        frame = frame.astype(np.uint8)
-        frame = cv2.resize(frame, (wh[0], wh[1]))
-        return frame
+    def post_process(self, frame: np.ndarray, wh: typing.Tuple[int, int]) -> np.ndarray:  # Model çıktısını işleyip orijinal boyuta getirir
+        frame = np.squeeze(frame)  # Gereksiz boyut çıkarılır (1,3,H,W -> 3,H,W)
+        frame = np.transpose(frame, (1, 2, 0))  # Kanal en sona alınır (CHW -> HWC)
+        frame = ((frame + 1.0) * 127.5).clip(0, 255).astype(np.uint8)  # Normalize geri alınır ve uint8 yapılır
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)  # BGR formatına çevrilir
+        return cv2.resize(frame, wh)  # Orijinal boyuta döndürülür
 
-    def __call__(self, frame: np.ndarray) -> np.ndarray:
-        # İşlem ve post işleme adımlarını uygularız
-        image = self.process_frame(frame)
-        outputs = self.ort_sess.run(None, {self.ort_sess._inputs_meta[0].name: np.expand_dims(image, axis=0)})
-        frame = self.post_process(outputs[0], frame.shape[:2][::-1])
-        return frame
+    def __call__(self, frame: np.ndarray) -> np.ndarray:  # Sınıf çağrıldığında otomatik olarak stilize işlemini yapar
+        h, w = frame.shape[:2]  # Görsel boyutları alınır
+        input_tensor = self.process_frame(frame)  # Giriş tensörü hazırlanır
+        output = self.model.run(None, {'input': input_tensor})[0]  # Model tahmini alınır
+        return self.post_process(output, (w, h))  # Çıktı işlenip döndürülür
 
+# İşaret dili veri seti sınıfı tanımlanıyor
+class SignLanguageDataset(Dataset):  # PyTorch Dataset sınıfından türetiliyor
+    def __init__(self, json_path, image_folder, image_size=(64, 64)):  # Yapıcı metod
+        with open(json_path, 'r') as f:  # JSON dosyası açılır
+            self.data = json.load(f)  # JSON verisi yüklenir
+        self.image_paths = []  # Görsel yolları tutulacak
+        self.labels = []  # Etiketler tutulacak
+        self.label_map = {word: idx for idx, word in enumerate(self.data.keys())}  # Kelime -> sayı eşleşmesi
+        self.image_folder = image_folder  # Görsel klasörü kaydedilir
+        self.image_size = image_size  # Görsel boyutu kaydedilir
 
-# =================== Dataset Sınıfı ===================
-class SignLanguageDataset(Dataset):
-    def __init__(self, json_path, image_folder, image_size=(64, 64)):
-        # JSON verilerini yükleriz
-        with open(json_path, "r", encoding="utf-8") as f:
-            self.data = json.load(f)
+        for word, filenames in self.data.items():  # Tüm kelime ve görseller dolaşılır
+            for filename in filenames:
+                self.image_paths.append(os.path.join(image_folder, filename))  # Görsel yolu eklenir
+                self.labels.append(self.label_map[word])  # Etiketi eklenir
 
-        self.image_paths = []
-        self.labels = []
-        self.label_map = {word: idx for idx, word in enumerate(self.data.keys())}
-
-        # Her kelime için görüntü dosyalarını okuruz
-        for word, frames in self.data.items():
-            for frame in frames:
-                img_path = os.path.normpath(os.path.join(image_folder, os.path.basename(frame["image_path"])))
-                if os.path.exists(img_path):
-                    img = cv2.imread(img_path)
-                    if img is not None:
-                        img = cv2.resize(img, image_size)
-                        img = img / 255.0
-                        self.image_paths.append(img)
-                        self.labels.append(self.label_map[word])
-
-        self.image_paths = np.array(self.image_paths, dtype=np.float32)
-        self.labels = np.array(self.labels, dtype=np.int64)
-
-    def _len_(self):
-        # Dataset uzunluğunu döner
+    def __len__(self):  # Veri seti uzunluğu
         return len(self.image_paths)
 
-    def _getitem_(self, idx):
-        # Belirtilen indeksteki görüntü ve etiketi döner
-        img = self.image_paths[idx]
-        label = self.labels[idx]
-        img = np.transpose(img, (2, 0, 1))
-        img = torch.tensor(img, dtype=torch.float32)
-        label = torch.tensor(label, dtype=torch.long)
-        return img, label
+    def __getitem__(self, idx):  # Belirli bir indeks için veri döndürülür
+        image_path = self.image_paths[idx]  # Görsel yolu alınır
+        image = cv2.imread(image_path)  # Görsel okunur
+        image = cv2.resize(image, self.image_size)  # Yeniden boyutlandırılır
+        image = image.transpose((2, 0, 1))  # Kanal en başa alınır (CHW)
+        image = torch.tensor(image, dtype=torch.float32) / 255.0  # Normalize edilip tensöre çevrilir
+        label = torch.tensor(self.labels[idx], dtype=torch.long)  # Etiket tensörü alınır
+        return image, label  # Görsel ve etiketi döndürülür
 
+# Basit bir yapay sinir ağı (ANN) tanımlanıyor
+class ANNModel(nn.Module):  # PyTorch sinir ağı modülünden türetiliyor
+    def __init__(self, num_classes):  # Yapıcı metod, sınıf sayısı alır
+        super(ANNModel, self).__init__()  # Üst sınıf yapıcısı çağrılır
+        self.flatten = nn.Flatten()  # 3D tensörü tek boyuta indirir
+        self.fc1 = nn.Linear(64 * 64 * 3, 256)  # Girişten 256 nörona
+        self.relu1 = nn.ReLU()  # Aktivasyon fonksiyonu
+        self.fc2 = nn.Linear(256, 128)  # Orta katman
+        self.relu2 = nn.ReLU()  # Aktivasyon
+        self.fc3 = nn.Linear(128, num_classes)  # Çıkış katmanı
 
-# =================== ANN Model Sınıfı ===================
-class ANNModel(nn.Module):
-    def __init__(self, num_classes):
-        super(ANNModel, self).__init__()
-        # Yapay sinir ağı (ANN) modelini oluşturuyoruz
-        self.flatten = nn.Flatten()
-        self.fc1 = nn.Linear(64 * 64 * 3, 512)
-        self.fc2 = nn.Linear(512, 256)
-        self.fc3 = nn.Linear(256, num_classes)
-        self.dropout = nn.Dropout(0.5)
+    def forward(self, x):  # İleri besleme işlemi
+        x = self.flatten(x)  # Görseli düzleştir
+        x = self.relu1(self.fc1(x))  # İlk katman
+        x = self.relu2(self.fc2(x))  # İkinci katman
+        x = self.fc3(x)  # Çıkış katmanı
+        return x  # Tahmin döndürülür
 
-    def forward(self, x):
-        # İleri geçiş fonksiyonu
-        x = self.flatten(x)
-        x = torch.relu(self.fc1(x))
-        x = self.dropout(x)
-        x = torch.relu(self.fc2(x))
-        x = self.dropout(x)
-        x = self.fc3(x)
-        return x
-
-
-# =================== Konuşmadan Metne Dönüşüm (Real-time) ===================
+# Mikrofonla konuşma kaydeder ve yazıya çevirir
 def record_and_recognize():
-    recognizer = sr.Recognizer()
-    mic = sr.Microphone()
-
-    with mic as source:
-        print("Bir şeyler söyleyin...")
-        recognizer.adjust_for_ambient_noise(source)
-        audio = recognizer.listen(source)
-
+    r = sr.Recognizer()  # Tanıyıcı nesne
+    with sr.Microphone() as source:  # Mikrofonu kaynak olarak al
+        print("Konuşmanızı bekliyorum...")
+        audio = r.listen(source)  # Ses kaydı yapılır
     try:
-        print("Tanımlanıyor...")
-        # Google API ile Türkçe dilinde ses tanıma
-        text = recognizer.recognize_google(audio, language="tr-TR")
-        print(f"Tanınan metin: {text}")  # Debug çıktısı
-        
-        # Baş harfi küçük yapmak için:
-        text = text[0].lower() + text[1:] if text else text
-        return text
+        text = r.recognize_google(audio, language="tr-TR")  # Google ile Türkçe tanıma
+        print("Tanınan Metin:", text)
+        return text  # Tanınan metin döndürülür
     except sr.UnknownValueError:
-        print("Üzgünüm, sesi anlayamadım.")
+        print("Konuşma anlaşılamadı.")  # Ses anlaşılamadıysa
         return ""
-    except sr.RequestError:
-        print("İstek başarısız oldu. İnternet bağlantınızı kontrol edin.")
+    except sr.RequestError as e:
+        print(f"Google API hatası: {e}")  # API hatası varsa
         return ""
 
-
-# =================== Video Üretici ===================
+# Girilen cümleye göre işaret dili görsellerinden video oluşturur
 def generate_animated_video(sentence, model, label_map, data, animegan, image_folder, output_video="animated_output.avi", fps=40):
-    words = sentence.split()
-    frame_list = []
-    target_resolution = (256, 256)
+    words = sentence.lower().split()  # Cümle küçük harfe çevrilip kelimelere ayrılır
+    frame_list = []  # Kare listesi oluşturulur
 
-    # Tanımlanan kelimeleri yazdırıyoruz
-    print(f"Sentence words: {words}")
+    for word in words:  # Her kelime için
+        if word in data:  # Eğer kelime JSON verisinde varsa
+            for image_name in data[word]:  # Kelimeye karşılık gelen her görsel için
+                image_path = os.path.join(image_folder, image_name)  # Görsel yolu oluşturulur
+                frame = cv2.imread(image_path)  # Görsel okunur
+                if frame is None:
+                    print(f"HATA: {image_path} dosyası bulunamadı.")  # Dosya yoksa uyarı
+                    continue
+                stylized_frame = animegan(frame)  # Anime stiline çevrilir
+                frame_list.append(stylized_frame)  # Listeye eklenir
 
-    # Her bir kelimeyi işleyip ilgili resimleri alıyoruz
-    for word in words:
-        if word in data:
-            for frame in data[word]:
-                img_path = os.path.normpath(os.path.join(image_folder, os.path.basename(frame["image_path"])))
-                if os.path.exists(img_path):
-                    img = cv2.imread(img_path)
-                    if img is not None:
-                        print(f"Found image: {img_path}")
-                        img = cv2.resize(img, target_resolution)
-                        anime_img = animegan(img)  # AnimeGAN ile animasyonlu hale getiriyoruz
-                        frame_list.append(anime_img)
-                    else:
-                        print(f"Failed to read image: {img_path}")
-                else:
-                    print(f"Image path does not exist: {img_path}")
-        else:
-            print(f"Warning: '{word}' not found in dataset!")
-
-    if not frame_list:
-        print("No frames generated!")
+    if not frame_list:  # Eğer hiç kare yoksa
+        print("Uygun çerçeve bulunamadı.")
         return
 
-    # Video oluşturma işlemi
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    out = cv2.VideoWriter(output_video, fourcc, fps, target_resolution)
+    height, width, _ = frame_list[0].shape  # Kare boyutu alınır
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')  # Video formatı belirlenir
+    out = cv2.VideoWriter(output_video, fourcc, fps, (width, height))  # Video dosyası hazırlanır
 
-    for frame in frame_list:
+    for frame in frame_list:  # Her kare video dosyasına yazılır
         out.write(frame)
 
-    out.release()
-    print(f"Animated video saved: {output_video}")
+    out.release()  # Video kaydı bitirilir
+    print(f"Video oluşturuldu: {output_video}")  # Bilgilendirme yapılır
 
-
-# =================== Ana Fonksiyon ===================
+# Ana program
 if __name__ == '__main__':
-    # Dosya yollarını belirliyoruz
-    json_path = r"output_data.json"
-    image_folder = r"OutputImages"
-    model_path = r"ann_sign_language_model.pth"
-    onnx_path = r"Hayao_64.onnx"
-    
-    # Dataset ve model initialization
-    dataset = SignLanguageDataset(json_path, image_folder)
-    num_classes = len(dataset.label_map)
-    model = ANNModel(num_classes)
-    model.load_state_dict(torch.load(model_path))
-    model.eval()
+    json_path = 'data/sign_language_data.json'  # JSON veri dosyası yolu
+    image_folder = 'data/sign_language_images'  # Görsellerin bulunduğu klasör
+    onnx_model_path = 'model/animegan.onnx'  # AnimeGAN ONNX modeli yolu
 
-    # AnimeGAN modelini yükliyoruz
-    animegan = AnimeGAN(onnx_path)
+    with open(json_path, 'r') as f:  # JSON dosyası açılır
+        data = json.load(f)  # JSON içeriği yüklenir
 
-    # Konuşmayı kaydediyoruz ve animasyona dönüştürüyoruz
-    print("Recording speech...")
-    sentence = record_and_recognize()
-    if sentence:
-        print(f"Recognized sentence: {sentence}")
-        generate_animated_video(sentence, model, dataset.label_map, dataset.data, animegan, image_folder)
-    else:
-        print("No speech recognized. Exiting...")
+    label_map = {word: idx for idx, word in enumerate(data.keys())}  # Etiket haritası oluşturulur
+
+    num_classes = len(label_map)  # Sınıf sayısı hesaplanır
+    model = ANNModel(num_classes)  # ANN modeli oluşturulur
+    model.load_state_dict(torch.load("model/sign_language_model.pth", map_location=torch.device('cpu')))  # Eğitimli model yüklenir
+    model.eval()  # Model değerlendirme moduna alınır
+
+    animegan = AnimeGAN(model_path=onnx_model_path)  # AnimeGAN modeli yüklenir
+
+    sentence = record_and_recognize()  # Ses kaydı alınıp metne çevrilir
+
+    generate_animated_video(sentence, model, label_map, data, animegan, image_folder)  # Video oluşturulur
